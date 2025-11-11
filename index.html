@@ -30,6 +30,19 @@
             margin: 0;
             overflow: hidden;
         }
+        /* Modal background overlay */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: rgba(0, 0, 0, 0.75);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 50;
+        }
     </style>
 </head>
 <body class="bg-gray-900">
@@ -42,7 +55,6 @@
         
         // --- Environment Variables (Will be empty/null outside the platform) ---
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'novel-planner-app';
-        // Note: firebaseConfig is empty outside the platform, triggering the fallback.
         const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
@@ -112,8 +124,12 @@
             const [loading, setLoading] = useState(true);
             const [isGenerating, setIsGenerating] = useState(false);
             const [firebaseReady, setFirebaseReady] = useState(false);
-            const [isPersistent, setIsPersistent] = useState(true); // Default to persistent
+            const [isPersistent, setIsPersistent] = useState(true); 
             const [errorBanner, setErrorBanner] = useState(null);
+            
+            // New State for Modal
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [newThreadName, setNewThreadName] = useState('');
 
             const dbRef = useRef(null);
             const authRef = useRef(null);
@@ -124,7 +140,6 @@
             const updateLocalThreadMessages = useCallback((threadId, userMsgObj, aiMsgObj) => {
                 setThreads(prevThreads => prevThreads.map(t => {
                     if (t.id === threadId) {
-                        // Find the last user message to avoid duplication if running optimistically
                         const newMessages = [...t.messages];
                         if (userMsgObj) {
                            newMessages.push(userMsgObj);
@@ -190,7 +205,6 @@
             // Effect 2: Load Threads (Only runs if persistent)
             useEffect(() => {
                 if (!firebaseReady || !isPersistent || !dbRef.current || !userIdRef.current) {
-                    // If not persistent, setLoading(false) already happened in Effect 1.
                     return;
                 }
 
@@ -232,24 +246,25 @@
                 return threads.find(t => t.id === activeThreadId);
             }, [threads, activeThreadId]);
             
-            const handleCreateThread = async (e) => {
-                e.preventDefault();
-                const threadName = prompt("Enter a name for your new idea thread (e.g., Main Plot Outline, Character: Elara):");
-                if (!threadName || !threadName.trim()) return;
+            const handleCreateThread = async () => {
+                if (!newThreadName.trim()) return;
+
+                const threadName = newThreadName.trim();
+                setNewThreadName('');
+                setIsModalOpen(false); // Close modal on success
 
                 const newThread = {
-                    id: isPersistent ? null : crypto.randomUUID(), // Local ID only if non-persistent
-                    name: threadName.trim(),
+                    id: isPersistent ? null : crypto.randomUUID(), 
+                    name: threadName,
                     createdAt: Date.now(),
                     messages: [{
                         role: 'system',
-                        text: `Welcome to the '${threadName.trim()}' thread! This is dedicated to developing this specific novel concept. Let's start with your first idea or question.`
+                        text: `Welcome to the '${threadName}' thread! This is dedicated to developing this specific novel concept. Let's start with your first idea or question.`
                     }]
                 };
                 
                 if (isPersistent) {
                     try {
-                        // Use Firestore for saving
                         const docRef = await addDoc(collection(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads'), newThread);
                         setActiveThreadId(docRef.id);
                     } catch (error) {
@@ -307,8 +322,46 @@
             }, [newMessage, currentThread, isGenerating, isPersistent, updateLocalThreadMessages]);
 
 
+            // --- Helper Component: Custom Modal ---
+            const NewThreadModal = () => (
+                <div className="modal-overlay">
+                    <div className="bg-gray-800 p-6 rounded-xl shadow-2xl w-full max-w-sm border border-indigo-700">
+                        <h3 className="text-xl font-bold mb-4 text-indigo-400">Name Your Idea Thread</h3>
+                        <p className="text-sm text-gray-400 mb-4">Choose a short, descriptive title (e.g., "Elara's Arc," "Magic System Rules").</p>
+                        <input
+                            type="text"
+                            value={newThreadName}
+                            onChange={(e) => setNewThreadName(e.target.value)}
+                            placeholder="e.g., Main Character Backstory"
+                            className="w-full p-3 mb-4 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                            onKeyPress={(e) => {
+                                if (e.key === 'Enter' && newThreadName.trim()) {
+                                    handleCreateThread();
+                                }
+                            }}
+                            autoFocus
+                        />
+                        <div className="flex justify-end space-x-3">
+                            <button
+                                onClick={() => { setIsModalOpen(false); setNewThreadName(''); }}
+                                className="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-600 hover:bg-gray-500 transition duration-150"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleCreateThread}
+                                disabled={!newThreadName.trim()}
+                                className="px-4 py-2 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-800 disabled:opacity-50 transition duration-150"
+                            >
+                                Create Thread
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+
+
             if (loading && firebaseReady) {
-                 // Brief wait for data to fetch
                 return (
                     <div className="flex items-center justify-center h-screen bg-gray-900 text-white">
                         <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-indigo-400"></div>
@@ -316,7 +369,6 @@
                     </div>
                 );
             } else if (loading && !firebaseReady) {
-                 // Longer wait for Firebase connection establishment
                  return (
                     <div className="flex items-center justify-center h-screen bg-gray-900 text-white">
                         <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-indigo-400"></div>
@@ -328,9 +380,12 @@
 
             return (
                 <div className="flex h-screen bg-gray-900 text-gray-100 font-inter">
+                    {/* Modal Overlay */}
+                    {isModalOpen && <NewThreadModal />}
+
                     {/* Error Banner */}
                     {errorBanner && (
-                        <div className="absolute top-0 left-0 right-0 p-3 bg-red-800 text-white text-center font-medium z-10">
+                        <div className="absolute top-0 left-0 right-0 p-3 bg-red-800 text-white text-center font-medium z-40">
                             {errorBanner}
                             <button onClick={() => setErrorBanner(null)} className="ml-4 text-sm font-semibold opacity-75 hover:opacity-100">
                                 (Dismiss)
@@ -344,7 +399,7 @@
                         <p className="text-xs text-gray-500 mb-4 break-words">User ID: {userIdRef.current || 'N/A'}</p>
 
                         <button
-                            onClick={handleCreateThread}
+                            onClick={() => setIsModalOpen(true)}
                             className="w-full py-2 px-4 mb-4 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 transition duration-150 shadow-md"
                         >
                             + New Thread
@@ -352,7 +407,7 @@
 
                         <nav className="flex-grow">
                             {threads.length === 0 ? (
-                                <p className="text-sm text-gray-500 italic">No threads yet. Start brainstorming!</p>
+                                <p className="text-sm text-gray-500 italic">No threads yet. Click '+ New Thread' above.</p>
                             ) : (
                                 threads.map(thread => (
                                     <button
@@ -414,7 +469,7 @@
                             <div ref={chatEndRef} />
                         </div>
 
-                        {/* Input Area */}
+                        <!-- Input Area -->
                         <footer className="p-4 border-t border-gray-700 bg-gray-800">
                             <form onSubmit={handleSendMessage} className="flex space-x-3">
                                 <input
@@ -422,7 +477,7 @@
                                     value={newMessage}
                                     onChange={(e) => setNewMessage(e.target.value)}
                                     placeholder={currentThread ? "Ask the AI a question about this thread's content..." : "Select a thread first..."}
-                                    disabled={!currentThread || !newMessage.trim() || isGenerating}
+                                    disabled={!currentThread || isGenerating}
                                     className="flex-1 p-3 rounded-lg bg-gray-700 border border-gray-600 text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
                                 />
                                 <button
