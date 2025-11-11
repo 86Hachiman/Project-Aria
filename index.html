@@ -1,282 +1,231 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Novel Brainstorm with Claude AI</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <style>
-    body { font-family: 'Inter', sans-serif; margin: 0; overflow: hidden; }
-    .modal-overlay {
-      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      background-color: rgba(0,0,0,0.75);
-      display: flex; justify-content: center; align-items: center; z-index: 50;
+import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+
+const App = () => {
+  const [threads, setThreads] = useState([]);
+  const [activeThreadId, setActiveThreadId] = useState(null);
+  const [newMessage, setNewMessage] = useState('');
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [newThreadName, setNewThreadName] = useState('');
+  const [errorBanner, setErrorBanner] = useState(null);
+  const chatEndRef = useRef(null);
+
+  const generateId = () => crypto.randomUUID();
+
+  const currentThread = useMemo(() => threads.find(t => t.id === activeThreadId), [threads, activeThreadId]);
+
+  const handleCreateThread = () => {
+    if (!newThreadName.trim()) return;
+    const newThread = {
+      id: generateId(),
+      name: newThreadName.trim(),
+      createdAt: Date.now(),
+      messages: [{ role: 'system', text: `Welcome to '${newThreadName.trim()}' thread!` }]
+    };
+    setThreads(prev => [newThread, ...prev]);
+    setActiveThreadId(newThread.id);
+    setNewThreadName('');
+    setIsModalOpen(false);
+  };
+
+  // Call backend proxy for Google Gemini
+  const callGemini = async (history) => {
+    const response = await fetch('/api/gemini-chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: history.map(m => ({ role: m.role, text: m.text })) }),
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error || 'Gemini request failed');
     }
-    .file-input-hidden { display: none; }
-  </style>
-</head>
-<body class="bg-gray-900">
-  <div id="root"></div>
+    const data = await response.json();
+    return data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+  };
 
-  <script type="text/babel">
-    const { useState, useEffect, useCallback, useMemo, useRef } = React;
-
-    const CLAUDE_API_KEY = 'YOUR_CLAUDE_API_KEY'; // Put your Claude API key here
-
-    async function callClaudeLLM(history) {
-      const url = 'https://api.anthropic.com/v1/complete';
-
-      // Construct prompt for Claude: Human and Assistant roles
-      const prompt = history.map(msg => {
-        const role = msg.role === 'user' ? 'Human' : 'Assistant';
-        return `${role}: ${msg.text}`;
-      }).join('\n') + '\nAssistant:';
-
-      const body = {
-        model: 'claude-2',
-        prompt: prompt,
-        max_tokens_to_sample: 1000,
-        stop_sequences: ["\nHuman:", "\nAssistant:"]
-      };
-
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': CLAUDE_API_KEY,
-          'anthropic-dangerous-direct-browser-access': 'true'
-        },
-        body: JSON.stringify(body)
-      });
-
-      if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error || `Claude API error: ${response.status}`);
+  const addMessagesToThread = (threadId, userMsg, aiMsg) => {
+    setThreads(prevThreads => prevThreads.map(t => {
+      if (t.id === threadId) {
+        const newMessages = [...t.messages];
+        if (userMsg) newMessages.push(userMsg);
+        if (aiMsg) newMessages.push(aiMsg);
+        return { ...t, messages: newMessages };
       }
+      return t;
+    }));
+  };
 
-      const data = await response.json();
-      return data.completion;
+  const handleSendMessage = useCallback(async (e) => {
+    e.preventDefault();
+    if (!newMessage.trim() || !currentThread || isGenerating) return;
+
+    const userMsgObj = { role: 'user', text: newMessage.trim(), timestamp: Date.now() };
+    const updatedHistory = [...currentThread.messages, userMsgObj];
+
+    setNewMessage('');
+    setIsGenerating(true);
+    setErrorBanner(null);
+
+    try {
+      addMessagesToThread(currentThread.id, userMsgObj, null);
+      const aiResponse = await callGemini(updatedHistory);
+      const aiMsgObj = { role: 'model', text: aiResponse.trim(), timestamp: Date.now() + 1 };
+      addMessagesToThread(currentThread.id, null, aiMsgObj);
+    } catch (error) {
+      setErrorBanner(`AI generation failed: ${error.message}`);
+    } finally {
+      setIsGenerating(false);
     }
+  }, [newMessage, currentThread, isGenerating]);
 
-    const App = () => {
-      const [threads, setThreads] = useState([]);
-      const [activeThreadId, setActiveThreadId] = useState(null);
-      const [newMessage, setNewMessage] = useState('');
-      const [isGenerating, setIsGenerating] = useState(false);
-      const [isModalOpen, setIsModalOpen] = useState(false);
-      const [newThreadName, setNewThreadName] = useState('');
-      const [errorBanner, setErrorBanner] = useState(null);
-      const chatEndRef = useRef(null);
+  useEffect(() => {
+    if (chatEndRef.current) chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+  }, [threads, activeThreadId]);
 
-      // Generate unique IDs for threads locally
-      const generateId = () => crypto.randomUUID();
+  // Export threads as JSON
+  const handleExport = () => {
+    if (threads.length === 0) {
+      setErrorBanner("No threads to export.");
+      return;
+    }
+    const dataStr = JSON.stringify(threads, null, 2);
+    const blob = new Blob([dataStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `novel-planner-export-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setErrorBanner("Threads exported successfully.");
+  };
 
-      const currentThread = useMemo(() => threads.find(t => t.id === activeThreadId), [threads, activeThreadId]);
-
-      const handleCreateThread = () => {
-        if (!newThreadName.trim()) return;
-        const newThread = {
-          id: generateId(),
-          name: newThreadName.trim(),
-          createdAt: Date.now(),
-          messages: [{
-            role: 'system',
-            text: `Welcome to '${newThreadName.trim()}'! Let's brainstorm your novel ideas here.`
-          }]
-        };
-        setThreads(prev => [newThread, ...prev]);
-        setActiveThreadId(newThread.id);
-        setNewThreadName('');
-        setIsModalOpen(false);
-      };
-
-      const addMessagesToThread = (threadId, userMsg, aiMsg) => {
-        setThreads(prevThreads => prevThreads.map(t => {
-          if (t.id === threadId) {
-            const newMessages = [...t.messages];
-            if (userMsg) newMessages.push(userMsg);
-            if (aiMsg) newMessages.push(aiMsg);
-            return { ...t, messages: newMessages };
-          }
-          return t;
+  // Import threads from JSON file
+  const handleImport = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const imported = JSON.parse(event.target.result);
+        if (!Array.isArray(imported)) throw new Error("Invalid file format");
+        const validThreads = imported.map(t => ({
+          id: t.id || generateId(),
+          name: t.name || "Imported Thread",
+          createdAt: t.createdAt || Date.now(),
+          messages: Array.isArray(t.messages) ? t.messages : []
         }));
-      };
+        setThreads(prev => [...validThreads, ...prev]);
+        setErrorBanner(`Imported ${validThreads.length} threads.`);
+      } catch (err) {
+        setErrorBanner("Import failed: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = null; // reset to allow re-import of same file
+  };
 
-      const handleSendMessage = useCallback(async (e) => {
-        e.preventDefault();
-        if (!newMessage.trim() || !currentThread || isGenerating) return;
-
-        const userMsgObj = { role: 'user', text: newMessage.trim(), timestamp: Date.now() };
-        const updatedHistory = [...currentThread.messages, userMsgObj];
-
-        setNewMessage('');
-        setIsGenerating(true);
-        setErrorBanner(null);
-
-        try {
-          addMessagesToThread(currentThread.id, userMsgObj, null);
-          const aiResponse = await callClaudeLLM(updatedHistory);
-          const aiMsgObj = { role: 'model', text: aiResponse.trim(), timestamp: Date.now() + 1 };
-          addMessagesToThread(currentThread.id, null, aiMsgObj);
-        } catch (error) {
-          setErrorBanner(`AI generation failed: ${error.message}`);
-        } finally {
-          setIsGenerating(false);
-        }
-      }, [newMessage, currentThread, isGenerating]);
-
-      useEffect(() => {
-        if (chatEndRef.current) chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
-      }, [threads, activeThreadId]);
-
-      const isButtonDisabled = !currentThread || !newMessage.trim() || isGenerating;
-      const disabledReason = isGenerating ? "Generating Response..." :
-        !currentThread ? "No Thread Selected. Create one first." : "Message is Empty";
-
-      const NewThreadModal = () => (
-        <div className="modal-overlay">
-          <div className="bg-gray-800 p-6 rounded-xl shadow-2xl w-full max-w-sm border border-indigo-700">
-            <h3 className="text-xl font-bold mb-4 text-indigo-400">Name Your Idea Thread</h3>
+  return (
+    <div className="flex h-screen bg-gray-900 text-gray-100 font-sans">
+      {isModalOpen && (
+        <div className="modal-overlay flex justify-center items-center fixed inset-0 bg-black bg-opacity-75 z-50">
+          <div className="bg-gray-800 p-6 rounded shadow-lg max-w-sm w-full">
+            <h3 className="text-lg font-bold mb-3">Name Your Idea Thread</h3>
             <input
-              type="text"
+              className="w-full p-2 mb-4 rounded bg-gray-700 border border-gray-600"
               value={newThreadName}
-              onChange={(e) => setNewThreadName(e.target.value)}
-              placeholder="e.g., Main Character Backstory"
-              className="w-full p-3 mb-4 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-              onKeyPress={(e) => {
-                if (e.key === 'Enter' && newThreadName.trim()) {
-                  handleCreateThread();
-                }
-              }}
+              onChange={e => setNewThreadName(e.target.value)}
+              placeholder="Thread Name"
+              onKeyDown={e => e.key === 'Enter' && handleCreateThread()}
               autoFocus
             />
-            <div className="flex justify-end space-x-3">
-              <button
-                onClick={() => { setIsModalOpen(false); setNewThreadName(''); }}
-                className="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-600 hover:bg-gray-500 transition duration-150"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleCreateThread}
-                disabled={!newThreadName.trim()}
-                className="px-4 py-2 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-800 disabled:opacity-50 transition duration-150"
-              >
-                Create Thread
-              </button>
+            <div className="flex justify-end space-x-2">
+              <button className="px-4 py-2 bg-gray-600 rounded" onClick={() => setIsModalOpen(false)}>Cancel</button>
+              <button className="px-4 py-2 bg-indigo-600 rounded disabled:opacity-50" disabled={!newThreadName.trim()} onClick={handleCreateThread}>Create</button>
             </div>
           </div>
         </div>
-      );
+      )}
 
-      return (
-        <div className="flex h-screen bg-gray-900 text-gray-100 font-inter">
-          {isModalOpen && <NewThreadModal />}
+      <aside className="w-72 bg-gray-800 p-4 flex flex-col overflow-y-auto">
+        <h1 className="text-indigo-400 text-2xl font-bold mb-4">Idea Threads</h1>
+        <button className="mb-3 py-2 px-4 bg-indigo-600 rounded" onClick={() => setIsModalOpen(true)}>+ New Thread</button>
+        <div className="mb-3 flex space-x-2">
+          <input type="file" accept=".json" onChange={handleImport} className="hidden" id="import-input" />
+          <label htmlFor="import-input" className="cursor-pointer flex-1 text-center py-2 bg-gray-700 rounded">Import JSON</label>
+          <button className="flex-1 py-2 bg-gray-700 rounded" onClick={handleExport}>Export JSON</button>
+        </div>
+        <nav className="flex-grow overflow-y-auto">
+          {threads.length === 0 ? (
+            <p className="text-gray-400 italic">No threads yet</p>
+          ) : (
+            threads.map(thread => (
+              <button
+                key={thread.id}
+                className={`w-full text-left py-2 px-3 mb-2 rounded ${thread.id === activeThreadId ? 'bg-indigo-700 font-semibold' : 'bg-gray-700 hover:bg-gray-600'}`}
+                onClick={() => setActiveThreadId(thread.id)}
+                title={thread.name}
+              >
+                {thread.name}
+              </button>
+            ))
+          )}
+        </nav>
+        {errorBanner && (
+          <div className="mt-2 p-2 bg-red-800 text-white rounded text-sm">
+            {errorBanner} <button onClick={() => setErrorBanner(null)} className="ml-2 underline">Dismiss</button>
+          </div>
+        )}
+      </aside>
 
-          {errorBanner && (
-            <div className="absolute top-0 left-0 right-0 p-3 bg-red-800 text-white text-center font-medium z-40">
-              {errorBanner}
-              <button onClick={() => setErrorBanner(null)} className="ml-4 text-sm font-semibold opacity-75 hover:opacity-100">(Dismiss)</button>
+      <main className="flex-1 flex flex-col">
+        <header className="p-4 border-b border-gray-700 bg-gray-800">
+          <h2 className="text-xl font-bold truncate">{currentThread?.name ?? "Select a Thread"}</h2>
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-gray-900">
+          {currentThread ? (
+            currentThread.messages.map((msg, i) => (
+              <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-xl p-4 rounded shadow-lg ${msg.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-gray-700 text-gray-100'}`}>
+                  <p className="text-xs font-semibold opacity-70 mb-1">{msg.role === 'user' ? 'You' : 'Assistant'}</p>
+                  <p className="whitespace-pre-wrap">{msg.text}</p>
+                </div>
+              </div>
+            ))
+          ) : (
+            <p className="text-gray-500 text-center mt-10">No thread selected.</p>
+          )}
+          {isGenerating && (
+            <div className="flex justify-start">
+              <div className="max-w-xl p-4 rounded shadow-lg bg-gray-700 text-gray-100 animate-pulse">
+                Assistant thinking...
+              </div>
             </div>
           )}
-
-          <aside className="w-72 bg-gray-800 border-r border-gray-700 flex flex-col p-4 overflow-y-auto" style={{ paddingTop: errorBanner ? '4rem' : '1rem' }}>
-            <h1 className="text-2xl font-bold mb-4 text-indigo-400">Idea Threads</h1>
-            <button
-              onClick={() => setIsModalOpen(true)}
-              className="w-full py-2 px-4 mb-3 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 transition duration-150 shadow-md"
-            >
-              + New Thread
-            </button>
-            <nav className="flex-grow">
-              {threads.length === 0 ? (
-                <p className="text-sm text-gray-500 italic">No threads yet. Click '+ New Thread' above.</p>
-              ) : (
-                threads.map(thread => (
-                  <button
-                    key={thread.id}
-                    onClick={() => setActiveThreadId(thread.id)}
-                    className={`w-full text-left py-2 px-3 mb-2 rounded-lg transition duration-150 ${thread.id === activeThreadId ? 'bg-indigo-700 text-white font-semibold shadow-inner' : 'bg-gray-700 hover:bg-gray-600'} text-sm truncate`}
-                    title={thread.name}
-                  >
-                    {thread.name}
-                  </button>
-                ))
-              )}
-            </nav>
-          </aside>
-
-          <main className="flex-1 flex flex-col">
-            <header className="p-4 border-b border-gray-700 bg-gray-800 shadow-lg">
-              <h2 className="text-xl font-bold truncate text-white">
-                {currentThread ? currentThread.name : 'Select or Create a Thread'}
-              </h2>
-            </header>
-
-            <div className="flex-1 overflow-y-auto p-6 space-y-4">
-              {currentThread ? (
-                currentThread.messages.map((msg, i) => (
-                  <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`max-w-xl p-4 rounded-xl shadow-lg ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-gray-700 text-gray-100 rounded-tl-none'}`}>
-                      <p className="text-xs font-semibold mb-1 opacity-70">{msg.role === 'user' ? 'You' : 'Assistant'}</p>
-                      <p className="text-sm whitespace-pre-wrap">{msg.text}</p>
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <div className="flex items-center justify-center h-full">
-                  <p className="text-gray-500 text-lg">Start a new thread to begin your novel brainstorm!</p>
-                </div>
-              )}
-              {isGenerating && (
-                <div className="flex justify-start">
-                  <div className="max-w-xl p-4 rounded-xl shadow-lg bg-gray-700 text-gray-100 rounded-tl-none flex items-center space-x-2">
-                    <div className="animate-pulse h-3 w-3 bg-indigo-400 rounded-full"></div>
-                    <p className="text-sm italic">Assistant thinking...</p>
-                  </div>
-                </div>
-              )}
-              <div ref={chatEndRef} />
-            </div>
-
-            <footer className="p-4 border-t border-gray-700 bg-gray-800">
-              <form onSubmit={handleSendMessage} className="flex space-x-3">
-                <input
-                  type="text"
-                  value={newMessage}
-                  onChange={(e) => setNewMessage(e.target.value)}
-                  placeholder={currentThread ? "Ask the AI a question about this thread's content..." : "Select a thread first..."}
-                  disabled={!currentThread || isGenerating}
-                  className="flex-1 p-3 rounded-lg bg-gray-700 border border-gray-600 text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
-                />
-                <button
-                  type="submit"
-                  disabled={isButtonDisabled}
-                  title={disabledReason}
-                  className="bg-indigo-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-indigo-700 disabled:bg-indigo-800 disabled:opacity-50 transition duration-150 shadow-lg flex items-center justify-center"
-                >
-                  {isGenerating ? (
-                    <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                    </svg>
-                  ) : 'Generate'}
-                </button>
-              </form>
-            </footer>
-          </main>
+          <div ref={chatEndRef} />
         </div>
-      );
-    };
 
-    const container = document.getElementById('root');
-    if (container) {
-      const root = ReactDOM.createRoot(container);
-      root.render(<App />);
-    }
-  </script>
-</body>
-</html>
+        <footer className="p-4 border-t border-gray-700 bg-gray-800">
+          <form onSubmit={handleSendMessage} className="flex space-x-3">
+            <input
+              type="text"
+              className="flex-1 p-3 rounded bg-gray-700 border border-gray-600 text-white placeholder-gray-400"
+              placeholder={currentThread ? "Ask the AI..." : "Select or create a thread first..."}
+              value={newMessage}
+              disabled={!currentThread || isGenerating}
+              onChange={e => setNewMessage(e.target.value)}
+            />
+            <button className="bg-indigo-600 px-6 py-3 rounded disabled:opacity-50" type="submit" disabled={!newMessage.trim() || !currentThread || isGenerating}>
+              {isGenerating ? 'Generating...' : 'Generate'}
+            </button>
+          </form>
+        </footer>
+      </main>
+    </div>
+  );
+};
+
+export default App;
