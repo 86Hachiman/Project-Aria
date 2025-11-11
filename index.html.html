@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Novelist's Brainstorm</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load React and ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Load Babel for JSX support in the browser -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Load Firebase/Firestore CDNs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, addDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Expose Firebase functions globally for the <script type="text/babel"> block
+        window.firebase = {
+            initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
+            getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, addDoc, setLogLevel
+        };
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body class="bg-gray-900">
+    <div id="root">
+        <!-- React App will be rendered here -->
+    </div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback, useMemo, useRef } = React;
+        
+        // --- Global variables provided by the Canvas environment (Mandatory Use) ---
+        // Fallbacks are essential for local execution
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'novel-planner-app';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Ensure Firebase globals are available
+        const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, addDoc } = window.firebase || {};
+
+
+        // LLM Configuration
+        const LLM_MODEL = "gemini-2.5-flash-preview-09-2025";
+        const LLM_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${LLM_MODEL}:generateContent`;
+        const LLM_SYSTEM_PROMPT = "You are a specialized Novel Assistant AI. Your goal is to help a writer develop their novel ideas. Use the entire conversation history provided to ensure your responses are grounded and consistent with previously established plot points, characters, and world-building elements. Maintain a supportive, creative, and collaborative tone.";
+
+        /**
+         * Handles the LLM API call with exponential backoff.
+         * @param {Array<Object>} history - The full message history of the current thread.
+         * @returns {Promise<string>} - The generated text response.
+         */
+        async function callLLM(history) {
+            // Note: The LLM model is now being called with the full history as requested.
+            
+            const contents = history.map(msg => ({
+                role: msg.role === 'user' ? 'user' : 'model',
+                parts: [{ text: msg.text }]
+            }));
+
+            const payload = {
+                contents: contents,
+                systemInstruction: { parts: [{ text: LLM_SYSTEM_PROMPT }] },
+            };
+
+            const apiKey = ""; // Canvas will provide this if needed
+
+            for (let attempt = 0; attempt < 5; attempt++) {
+                try {
+                    const url = `${LLM_API_URL}?key=${apiKey}`;
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        if (response.status === 429 && attempt < 4) {
+                            const delay = Math.pow(2, attempt) * 1000;
+                            await new Promise(resolve => setTimeout(resolve, delay));
+                            continue;
+                        }
+                        throw new Error(`LLM API request failed with status: ${response.status}`);
+                    }
+
+                    const result = await response.json();
+                    const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                    if (text) {
+                        return text;
+                    } else {
+                        throw new Error("LLM response was empty or malformed.");
+                    }
+
+                } catch (error) {
+                    console.error(`Attempt ${attempt + 1} failed:`, error);
+                    if (attempt === 4) throw new Error("Failed to communicate with the Novel Assistant AI after multiple retries.");
+                }
+            }
+        }
+
+        // --- Main React Component ---
+
+        const App = () => {
+            const [threads, setThreads] = useState([]);
+            const [activeThreadId, setActiveThreadId] = useState(null);
+            const [newMessage, setNewMessage] = useState('');
+            const [loading, setLoading] = useState(true);
+            const [isGenerating, setIsGenerating] = useState(false);
+            const [firebaseReady, setFirebaseReady] = useState(false);
+
+            const dbRef = useRef(null);
+            const authRef = useRef(null);
+            const userIdRef = useRef(null);
+            const chatEndRef = useRef(null);
+
+            // Effect 1: Initialize Firebase and handle Authentication
+            useEffect(() => {
+                if (!initializeApp) return console.error("Firebase libraries not loaded.");
+                
+                try {
+                    const app = initializeApp(firebaseConfig);
+                    authRef.current = getAuth(app);
+                    dbRef.current = getFirestore(app);
+
+                    const unsubscribe = onAuthStateChanged(authRef.current, async (user) => {
+                        if (!user) {
+                            if (initialAuthToken) {
+                                await signInWithCustomToken(authRef.current, initialAuthToken);
+                            } else {
+                                await signInAnonymously(authRef.current);
+                            }
+                        }
+                        userIdRef.current = authRef.current.currentUser?.uid || crypto.randomUUID();
+                        setFirebaseReady(true);
+                    });
+
+                    return () => unsubscribe();
+                } catch (error) {
+                    console.error("Firebase initialization failed:", error);
+                    setLoading(false);
+                }
+            }, []);
+
+            // Effect 2: Load Threads and set up Snapshot Listener
+            useEffect(() => {
+                if (!firebaseReady || !dbRef.current || !userIdRef.current) return;
+
+                const threadsCollectionRef = collection(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads');
+                const threadsQuery = query(threadsCollectionRef, orderBy('createdAt', 'desc'));
+
+                const unsubscribe = onSnapshot(threadsQuery, (snapshot) => {
+                    const newThreads = snapshot.docs.map(doc => ({
+                        id: doc.id,
+                        ...doc.data()
+                    }));
+
+                    setThreads(newThreads);
+                    if (!activeThreadId && newThreads.length > 0) {
+                        setActiveThreadId(newThreads[0].id);
+                    } else if (activeThreadId && !newThreads.some(t => t.id === activeThreadId)) {
+                        setActiveThreadId(newThreads.length > 0 ? newThreads[0].id : null);
+                    }
+
+                    setLoading(false);
+                }, (error) => {
+                    console.error("Error fetching threads:", error);
+                    setLoading(false);
+                });
+
+                return () => unsubscribe();
+            }, [firebaseReady, activeThreadId]);
+
+            // Effect 3: Scroll to the bottom of the chat when messages update
+            useEffect(() => {
+                if (chatEndRef.current) {
+                    chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+                }
+            }, [activeThreadId, threads]);
+
+
+            const currentThread = useMemo(() => {
+                return threads.find(t => t.id === activeThreadId);
+            }, [threads, activeThreadId]);
+
+            const handleCreateThread = async (e) => {
+                e.preventDefault();
+                const threadName = prompt("Enter a name for your new idea thread (e.g., Main Plot Outline, Character: Elara):");
+                if (!threadName || !threadName.trim()) return;
+
+                const newThread = {
+                    name: threadName.trim(),
+                    createdAt: Date.now(),
+                    messages: [{
+                        role: 'system',
+                        text: `Welcome to the '${threadName.trim()}' thread! This is dedicated to developing this specific novel concept. Let's start with your first idea or question.`
+                    }]
+                };
+
+                try {
+                    const docRef = await addDoc(collection(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads'), newThread);
+                    setActiveThreadId(docRef.id);
+                } catch (error) {
+                    console.error("Error creating new thread:", error);
+                }
+            };
+
+            const handleSendMessage = useCallback(async (e) => {
+                e.preventDefault();
+                if (!newMessage.trim() || !currentThread || isGenerating) return;
+
+                const userMessage = newMessage.trim();
+                setNewMessage('');
+                setIsGenerating(true);
+
+                const threadDocRef = doc(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads', currentThread.id);
+
+                try {
+                    // 1. Locally update messages for optimistic display
+                    const userMsgObj = { role: 'user', text: userMessage, timestamp: Date.now() };
+
+                    // 2. Add user message to Firestore
+                    await updateDoc(threadDocRef, {
+                        messages: arrayUnion(userMsgObj)
+                    });
+
+                    // 3. Prepare full history for LLM call
+                    const updatedHistory = [...currentThread.messages, userMsgObj];
+
+                    // 4. Call the LLM
+                    const aiResponseText = await callLLM(updatedHistory);
+
+                    // 5. Add AI response to Firestore
+                    const aiMsgObj = { role: 'model', text: aiResponseText, timestamp: Date.now() + 1 }; // +1 to ensure order
+                    await updateDoc(threadDocRef, {
+                        messages: arrayUnion(aiMsgObj)
+                    });
+
+                } catch (error) {
+                    console.error("Error during send message/LLM call:", error);
+                    // Using a non-alert message box for better user experience
+                    // alert(`Failed to get AI response: ${error.message}`); 
+                } finally {
+                    setIsGenerating(false);
+                }
+            }, [newMessage, currentThread, isGenerating]);
+
+
+            if (loading || !firebaseReady) {
+                return (
+                    <div className="flex items-center justify-center h-screen bg-gray-900 text-white">
+                        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-indigo-400"></div>
+                        <p className="ml-3">Loading Novelist's Brain...</p>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="flex h-screen bg-gray-900 text-gray-100 font-inter">
+                    {/* Sidebar */}
+                    <aside className="w-72 bg-gray-800 border-r border-gray-700 flex flex-col p-4 overflow-y-auto">
+                        <h1 className="text-2xl font-bold mb-4 text-indigo-400">Idea Threads</h1>
+                        <p className="text-xs text-gray-500 mb-4 break-words">User ID: {userIdRef.current}</p>
+
+                        <button
+                            onClick={handleCreateThread}
+                            className="w-full py-2 px-4 mb-4 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 transition duration-150 shadow-md"
+                        >
+                            + New Thread
+                        </button>
+
+                        <nav className="flex-grow">
+                            {threads.length === 0 ? (
+                                <p className="text-sm text-gray-500 italic">No threads yet. Start brainstorming!</p>
+                            ) : (
+                                threads.map(thread => (
+                                    <button
+                                        key={thread.id}
+                                        onClick={() => setActiveThreadId(thread.id)}
+                                        className={`w-full text-left py-2 px-3 mb-2 rounded-lg transition duration-150 ${thread.id === activeThreadId ? 'bg-indigo-700 text-white font-semibold shadow-inner' : 'bg-gray-700 hover:bg-gray-600'
+                                            } text-sm truncate`}
+                                        title={thread.name}
+                                    >
+                                        {thread.name}
+                                    </button>
+                                ))
+                            )}
+                        </nav>
+                    </aside>
+
+                    {/* Chat Area */}
+                    <main className="flex-1 flex flex-col">
+                        <header className="p-4 border-b border-gray-700 bg-gray-800 shadow-lg">
+                            <h2 className="text-xl font-bold truncate text-white">
+                                {currentThread ? currentThread.name : 'Select or Create a Thread'}
+                            </h2>
+                        </header>
+
+                        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+                            {currentThread ? (
+                                currentThread.messages.map((msg, index) => (
+                                    <div
+                                        key={index}
+                                        className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                                    >
+                                        <div className={`max-w-xl p-4 rounded-xl shadow-lg ${msg.role === 'user'
+                                            ? 'bg-indigo-600 text-white rounded-br-none'
+                                            : 'bg-gray-700 text-gray-100 rounded-tl-none'
+                                            }`}
+                                        >
+                                            <p className="text-xs font-semibold mb-1 opacity-70">
+                                                {msg.role === 'user' ? 'You' : 'Assistant'}
+                                            </p>
+                                            <p className="text-sm whitespace-pre-wrap">{msg.text}</p>
+                                        </div>
+                                    </div>
+                                ))
+                            ) : (
+                                <div className="flex items-center justify-center h-full">
+                                    <p className="text-gray-500 text-lg">
+                                        Start a new thread to begin your novel brainstorm!
+                                    </p>
+                                </div>
+                            )}
+                            {isGenerating && (
+                                <div className="flex justify-start">
+                                    <div className="max-w-xl p-4 rounded-xl shadow-lg bg-gray-700 text-gray-100 rounded-tl-none flex items-center space-x-2">
+                                        <div className="animate-pulse h-3 w-3 bg-indigo-400 rounded-full"></div>
+                                        <p className="text-sm italic">Assistant thinking...</p>
+                                    </div>
+                                </div>
+                            )}
+                            <div ref={chatEndRef} />
+                        </div>
+
+                        {/* Input Area */}
+                        <footer className="p-4 border-t border-gray-700 bg-gray-800">
+                            <form onSubmit={handleSendMessage} className="flex space-x-3">
+                                <input
+                                    type="text"
+                                    value={newMessage}
+                                    onChange={(e) => setNewMessage(e.target.value)}
+                                    placeholder={currentThread ? "Ask the AI a question about this thread's content..." : "Select a thread first..."}
+                                    disabled={!currentThread || !newMessage.trim() || isGenerating}
+                                    className="flex-1 p-3 rounded-lg bg-gray-700 border border-gray-600 text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
+                                />
+                                <button
+                                    type="submit"
+                                    disabled={!currentThread || !newMessage.trim() || isGenerating}
+                                    className="bg-indigo-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-indigo-700 disabled:bg-indigo-800 disabled:opacity-50 transition duration-150 shadow-lg flex items-center justify-center"
+                                >
+                                    {isGenerating ? (
+                                        <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                        </svg>
+                                    ) : 'Generate'}
+                                </button>
+                            </form>
+                        </footer>
+                    </main>
+                </div>
+            );
+        };
+
+        // Standard React rendering to the 'root' element
+        const container = document.getElementById('root');
+        if (container) {
+            const root = ReactDOM.createRoot(container);
+            root.render(<App />);
+        }
+    </script>
+</body>
+</html>
