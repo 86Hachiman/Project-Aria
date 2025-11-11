@@ -1,635 +1,326 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Novelist's Brainstorm</title>
-    <!-- Load Tailwind CSS -->
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Novelist's Brainstorm with Perplexity AI</title>
+    <!-- Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Load React and ReactDOM -->
+    <!-- React and ReactDOM CDN -->
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <!-- Load Babel for JSX support in the browser -->
+    <!-- Babel for JSX -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <!-- Load Firebase/Firestore CDNs -->
-    <script type="module">
-        // Import necessary Firebase functions (only if config is present)
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, addDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-        
-        // Expose Firebase functions globally for the <script type="text/babel"> block
-        window.firebase = {
-            initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
-            getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, addDoc, setLogLevel
-        };
-
-        // Log levels for Firestore debugging (added safety check)
-        if (typeof setLogLevel !== 'undefined') {
-            setLogLevel('debug');
-        }
-    </script>
     <style>
-        body {
-            font-family: 'Inter', sans-serif;
-            margin: 0;
-            overflow: hidden;
-        }
-        /* Modal background overlay */
+        body { font-family: 'Inter', sans-serif; margin: 0; overflow: hidden; }
         .modal-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background-color: rgba(0, 0, 0, 0.75);
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            z-index: 50;
+            display: flex; justify-content: center; align-items: center; z-index: 50;
         }
-        /* Hide the file input but keep its functionality */
-        .file-input-hidden {
-            display: none;
-        }
+        .file-input-hidden { display: none; }
     </style>
 </head>
 <body class="bg-gray-900">
-    <div id="root">
-        <!-- React App will be rendered here -->
-    </div>
-
+    <div id="root"></div>
+    
     <script type="text/babel">
-        const { useState, useEffect, useCallback, useMemo, useRef } = React;
-        
-        // --- Environment Variables ---
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'novel-planner-app';
-        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+      const { useState, useEffect, useCallback, useMemo, useRef } = React;
 
-        const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, addDoc } = window.firebase || {};
-        
-        // LLM Configuration
-        const LLM_MODEL = "gemini-2.5-flash-preview-09-2025";
-        const LLM_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${LLM_MODEL}:generateContent`;
-        const LLM_SYSTEM_PROMPT = "You are a specialized Novel Assistant AI. Your goal is to help a writer develop their novel ideas. Use the entire conversation history provided to ensure your responses are grounded and consistent with previously established plot points, characters, and world-building elements. Maintain a supportive, creative, and collaborative tone.";
+      // Replace with your Perplexity API key securely (for example, inject via env var or backend)
+      const PERPLEXITY_API_KEY = 'YOUR_PERPLEXITY_API_KEY';
 
-        /**
-         * Handles the LLM API call with exponential backoff.
-         */
-        async function callLLM(history) {
-            const contents = history.map(msg => ({
-                role: msg.role === 'user' ? 'user' : 'model',
-                parts: [{ text: msg.text }]
-            }));
+      // Call Perplexity AI LLM chat completions endpoint
+      async function callPerplexityLLM(history) {
+          const url = 'https://api.perplexity.ai/chat/completions';
 
-            const payload = {
-                contents: contents,
-                systemInstruction: { parts: [{ text: LLM_SYSTEM_PROMPT }] },
-            };
+          // Format message history for Perplexity API format
+          const messages = history.map(msg => ({
+              role: msg.role === 'user' ? 'user' : 'assistant',
+              content: msg.text
+          }));
 
-            const apiKey = ""; // Canvas will provide this if needed
+          // Prepend system prompt
+          messages.unshift({
+              role: 'system',
+              content: "You are a specialized Novel Assistant AI. Help the user develop their novel ideas using context."
+          });
 
-            for (let attempt = 0; attempt < 5; attempt++) {
-                try {
-                    const url = `${LLM_API_URL}?key=${apiKey}`;
-                    const response = await fetch(url, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
+          const payload = {
+              model: 'sonar-pro',  // example model, update as needed
+              messages: messages,
+              max_tokens: 1000
+          };
 
-                    if (!response.ok) {
-                        if (response.status === 429 && attempt < 4) {
-                            const delay = Math.pow(2, attempt) * 1000;
-                            await new Promise(resolve => setTimeout(resolve, delay));
-                            continue;
-                        }
-                        // For non-retryable errors, throw them immediately
-                        const errorBody = await response.json();
-                        const errorMessage = errorBody.error?.message || `LLM API request failed with status: ${response.status}`;
-                        throw new Error(errorMessage);
-                    }
+          const response = await fetch(url, {
+              method: 'POST',
+              headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${PERPLEXITY_API_KEY}`
+              },
+              body: JSON.stringify(payload)
+          });
 
-                    const result = await response.json();
-                    const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!response.ok) {
+              const errorBody = await response.json();
+              throw new Error(errorBody.error?.message || `Perplexity API error: ${response.status}`);
+          }
 
-                    if (text) {
-                        return text;
-                    } else {
-                        throw new Error("LLM response was empty or malformed.");
-                    }
+          const data = await response.json();
+          const text = data.choices?.[0]?.message?.content;
 
-                } catch (error) {
-                    console.error(`Attempt ${attempt + 1} failed:`, error);
-                    if (attempt === 4) throw new Error("Failed to communicate with the Novel Assistant AI after multiple retries.");
-                    throw error; 
-                }
-            }
-        }
+          if (!text) {
+              throw new Error("No response text from Perplexity API");
+          }
 
-        // --- Main React Component ---
+          return text;
+      }
 
-        const App = () => {
-            const [threads, setThreads] = useState([]);
-            const [activeThreadId, setActiveThreadId] = useState(null);
-            const [newMessage, setNewMessage] = useState('');
-            const [loading, setLoading] = useState(true);
-            const [isGenerating, setIsGenerating] = useState(false);
-            const [firebaseReady, setFirebaseReady] = useState(false);
-            const [isPersistent, setIsPersistent] = useState(true); 
-            const [errorBanner, setErrorBanner] = useState(null);
-            
-            const [isModalOpen, setIsModalOpen] = useState(false);
-            const [newThreadName, setNewThreadName] = useState('');
+      const App = () => {
+          const [threads, setThreads] = useState([]);
+          const [activeThreadId, setActiveThreadId] = useState(null);
+          const [newMessage, setNewMessage] = useState('');
+          const [isGenerating, setIsGenerating] = useState(false);
+          const [isModalOpen, setIsModalOpen] = useState(false);
+          const [newThreadName, setNewThreadName] = useState('');
+          const [errorBanner, setErrorBanner] = useState(null);
+          const chatEndRef = useRef(null);
 
-            const dbRef = useRef(null);
-            const authRef = useRef(null);
-            const userIdRef = useRef(null);
-            const chatEndRef = useRef(null);
-            const fileInputRef = useRef(null); // Ref for file import
+          // Generate unique ID for local threads
+          const generateId = () => crypto.randomUUID();
 
-            // Helper function for local state updates (when persistence is off)
-            const updateLocalThreadMessages = useCallback((threadId, userMsgObj, aiMsgObj) => {
-                setThreads(prevThreads => prevThreads.map(t => {
-                    if (t.id === threadId) {
-                        const newMessages = [...t.messages];
-                        if (userMsgObj) {
-                           newMessages.push(userMsgObj);
-                        }
-                        if (aiMsgObj) {
-                            newMessages.push(aiMsgObj);
-                        }
-                        return { 
-                            ...t, 
-                            messages: newMessages
-                        };
-                    }
-                    return t;
-                }));
-            }, []);
+          // Get current active thread object
+          const currentThread = useMemo(() => threads.find(t => t.id === activeThreadId), [threads, activeThreadId]);
 
-            // Effect 1: Initialize Firebase or Fallback to Local Mode
-            useEffect(() => {
-                if (Object.keys(firebaseConfig).length === 0 || !initializeApp) {
-                    setErrorBanner("Database connection failed. App is running in **non-persistent** mode (data will NOT be saved when you close the tab).");
-                    setIsPersistent(false);
-                    setFirebaseReady(true);
-                    setLoading(false);
-                    userIdRef.current = 'local-user';
-                    return;
-                }
-                
-                try {
-                    const app = initializeApp(firebaseConfig);
-                    authRef.current = getAuth(app);
-                    dbRef.current = getFirestore(app);
+          // Handle creating new thread
+          const handleCreateThread = () => {
+              if (!newThreadName.trim()) return;
+              const newThread = {
+                  id: generateId(),
+                  name: newThreadName.trim(),
+                  createdAt: Date.now(),
+                  messages: [{
+                      role: 'system',
+                      text: `Welcome to the '${newThreadName.trim()}' thread! This is dedicated to developing this specific novel concept. Let's start with your first idea or question.`
+                  }]
+              };
+              setThreads(prev => [newThread, ...prev]);
+              setActiveThreadId(newThread.id);
+              setNewThreadName('');
+              setIsModalOpen(false);
+          };
 
-                    const unsubscribe = onAuthStateChanged(authRef.current, async (user) => {
-                        if (!user) {
-                            try {
-                                if (initialAuthToken) {
-                                    await signInWithCustomToken(authRef.current, initialAuthToken);
-                                } else {
-                                    await signInAnonymously(authRef.current);
-                                }
-                            } catch(authError) {
-                                console.error("Sign-in failed:", authError);
-                                setErrorBanner("Authentication failed. Running non-persistent.");
-                                setIsPersistent(false);
-                            }
-                        }
-                        userIdRef.current = authRef.current.currentUser?.uid || crypto.randomUUID();
-                        setFirebaseReady(true);
-                    }, (authError) => {
-                        console.error("CRITICAL AUTH LISTENER ERROR:", authError);
-                        setErrorBanner("Authentication Failed. App will be non-persistent.");
-                        setIsPersistent(false);
-                        setFirebaseReady(true);
-                        setLoading(false);
-                    });
+          // Handles adding messages locally (user + assistant)
+          const addMessagesToThread = (threadId, userMsg, aiMsg) => {
+              setThreads(prevThreads => prevThreads.map(t => {
+                  if (t.id === threadId) {
+                      const newMessages = [...t.messages];
+                      if (userMsg) newMessages.push(userMsg);
+                      if (aiMsg) newMessages.push(aiMsg);
+                      return { ...t, messages: newMessages };
+                  }
+                  return t;
+              }));
+          };
 
-                    return () => unsubscribe();
-                } catch (error) {
-                    console.error("CRITICAL: Firebase initialization failed:", error);
-                    setErrorBanner("Initialization Failed. App will be non-persistent.");
-                    setIsPersistent(false);
-                    setFirebaseReady(true);
-                    setLoading(false);
-                }
-            }, []);
+          // Handle sending new message and calling LLM
+          const handleSendMessage = useCallback(async (e) => {
+              e.preventDefault();
+              if (!newMessage.trim() || !currentThread || isGenerating) return;
 
-            // Effect 2: Load Threads (Only runs if persistent)
-            useEffect(() => {
-                if (!firebaseReady || !isPersistent || !dbRef.current || !userIdRef.current) {
-                    if (!isPersistent) setLoading(false);
-                    return;
-                }
+              const userMsgObj = { role: 'user', text: newMessage.trim(), timestamp: Date.now() };
+              const updatedHistory = [...currentThread.messages, userMsgObj];
 
-                const threadsCollectionRef = collection(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads');
-                const threadsQuery = query(threadsCollectionRef, orderBy('createdAt', 'desc'));
+              setNewMessage('');
+              setIsGenerating(true);
+              setErrorBanner(null);
 
-                const unsubscribe = onSnapshot(threadsQuery, (snapshot) => {
-                    const newThreads = snapshot.docs.map(doc => ({
-                        id: doc.id,
-                        ...doc.data()
-                    }));
+              try {
+                  // Optimistically add user message
+                  addMessagesToThread(currentThread.id, userMsgObj, null);
 
-                    setThreads(newThreads);
-                    // Ensure active thread ID is valid or set to the latest one
-                    if (!activeThreadId || !newThreads.some(t => t.id === activeThreadId)) {
-                        if (newThreads.length > 0) {
-                             setActiveThreadId(newThreads[0].id);
-                        } else {
-                             setActiveThreadId(null);
-                        }
-                    }
+                  // Call Perplexity API for assistant response
+                  const aiResponseText = await callPerplexityLLM(updatedHistory);
 
-                    setLoading(false);
-                }, (error) => {
-                    console.error("FIRESTORE SNAPSHOT ERROR:", error);
-                    setErrorBanner("Failed to load threads from database. Check security rules. Switching to non-persistent mode.");
-                    setIsPersistent(false); // Fallback on snapshot error
-                    setLoading(false);
-                });
+                  // Add assistant message
+                  const aiMsgObj = { role: 'assistant', text: aiResponseText, timestamp: Date.now() + 1 };
+                  addMessagesToThread(currentThread.id, null, aiMsgObj);
+              } catch (error) {
+                  console.error("Error during LLM call:", error);
+                  setErrorBanner(`AI generation failed: ${error.message}`);
+              } finally {
+                  setIsGenerating(false);
+              }
+          }, [newMessage, currentThread, isGenerating]);
 
-                return () => unsubscribe();
-            }, [firebaseReady, activeThreadId, isPersistent]);
+          // Scroll chat to bottom on messages update
+          useEffect(() => {
+              if (chatEndRef.current) chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+          }, [threads, activeThreadId]);
 
-            // Effect 3: Scroll to the bottom of the chat when messages update
-            useEffect(() => {
-                if (chatEndRef.current) {
-                    chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
-                }
-            }, [activeThreadId, threads]);
+          const isButtonDisabled = !currentThread || !newMessage.trim() || isGenerating;
+          const disabledReason = isGenerating ? "Generating Response..." :
+              !currentThread ? "No Thread Selected. Create one first." : "Message is Empty";
 
+          // Modal for creating new thread
+          const NewThreadModal = () => (
+              <div className="modal-overlay">
+                  <div className="bg-gray-800 p-6 rounded-xl shadow-2xl w-full max-w-sm border border-indigo-700">
+                      <h3 className="text-xl font-bold mb-4 text-indigo-400">Name Your Idea Thread</h3>
+                      <p className="text-sm text-gray-400 mb-4">Choose a short, descriptive title.</p>
+                      <input
+                          type="text"
+                          value={newThreadName}
+                          onChange={(e) => setNewThreadName(e.target.value)}
+                          placeholder="e.g., Main Character Backstory"
+                          className="w-full p-3 mb-4 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                          onKeyPress={(e) => {
+                              if (e.key === 'Enter' && newThreadName.trim()) {
+                                  handleCreateThread();
+                              }
+                          }}
+                          autoFocus
+                      />
+                      <div className="flex justify-end space-x-3">
+                          <button
+                              onClick={() => { setIsModalOpen(false); setNewThreadName(''); }}
+                              className="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-600 hover:bg-gray-500 transition duration-150"
+                          >
+                              Cancel
+                          </button>
+                          <button
+                              onClick={handleCreateThread}
+                              disabled={!newThreadName.trim()}
+                              className="px-4 py-2 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-800 disabled:opacity-50 transition duration-150"
+                          >
+                              Create Thread
+                          </button>
+                      </div>
+                  </div>
+              </div>
+          );
 
-            const currentThread = useMemo(() => {
-                return threads.find(t => t.id === activeThreadId);
-            }, [threads, activeThreadId]);
-            
-            const handleCreateThread = async () => {
-                if (!newThreadName.trim()) return;
+          return (
+              <div className="flex h-screen bg-gray-900 text-gray-100 font-inter">
+                  {isModalOpen && <NewThreadModal />}
 
-                const threadName = newThreadName.trim();
-                setNewThreadName('');
-                setIsModalOpen(false); // Close modal on success
+                  {errorBanner && (
+                      <div className="absolute top-0 left-0 right-0 p-3 bg-red-800 text-white text-center font-medium z-40">
+                          {errorBanner}
+                          <button onClick={() => setErrorBanner(null)} className="ml-4 text-sm font-semibold opacity-75 hover:opacity-100">
+                              (Dismiss)
+                          </button>
+                      </div>
+                  )}
 
-                const newThread = {
-                    id: isPersistent ? null : crypto.randomUUID(), 
-                    name: threadName,
-                    createdAt: Date.now(),
-                    messages: [{
-                        role: 'system',
-                        text: `Welcome to the '${threadName}' thread! This is dedicated to developing this specific novel concept. Let's start with your first idea or question.`
-                    }]
-                };
-                
-                if (isPersistent) {
-                    try {
-                        const docRef = await addDoc(collection(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads'), newThread);
-                        setActiveThreadId(docRef.id);
-                    } catch (error) {
-                        console.error("Error creating new thread (Persistent):", error);
-                        setErrorBanner("Failed to save thread to database. Check connection. Thread was not created.");
-                    }
-                } else {
-                    // Use Local State for saving (Non-persistent)
-                    setThreads(prevThreads => [newThread, ...prevThreads]);
-                    setActiveThreadId(newThread.id);
-                }
-            };
+                  {/* Sidebar */}
+                  <aside className="w-72 bg-gray-800 border-r border-gray-700 flex flex-col p-4 overflow-y-auto" style={{ paddingTop: errorBanner ? '4rem' : '1rem' }}>
+                      <h1 className="text-2xl font-bold mb-4 text-indigo-400">Idea Threads</h1>
+                      <button
+                          onClick={() => setIsModalOpen(true)}
+                          className="w-full py-2 px-4 mb-3 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 transition duration-150 shadow-md"
+                      >
+                          + New Thread
+                      </button>
+                      <nav className="flex-grow">
+                          {threads.length === 0 ? (
+                              <p className="text-sm text-gray-500 italic">No threads yet. Click '+ New Thread' above.</p>
+                          ) : (
+                              threads.map(thread => (
+                                  <button
+                                      key={thread.id}
+                                      onClick={() => setActiveThreadId(thread.id)}
+                                      className={`w-full text-left py-2 px-3 mb-2 rounded-lg transition duration-150 ${thread.id === activeThreadId ? 'bg-indigo-700 text-white font-semibold shadow-inner' : 'bg-gray-700 hover:bg-gray-600'} text-sm truncate`}
+                                      title={thread.name}
+                                  >
+                                      {thread.name}
+                                  </button>
+                              ))
+                          )}
+                      </nav>
+                  </aside>
 
-            const handleSendMessage = useCallback(async (e) => {
-                e.preventDefault();
-                if (!newMessage.trim() || !currentThread || isGenerating) return;
+                  {/* Chat Area */}
+                  <main className="flex-1 flex flex-col">
+                      <header className="p-4 border-b border-gray-700 bg-gray-800 shadow-lg">
+                          <h2 className="text-xl font-bold truncate text-white">
+                              {currentThread ? currentThread.name : 'Select or Create a Thread'}
+                          </h2>
+                      </header>
 
-                const userMessage = newMessage.trim();
-                setNewMessage('');
-                setIsGenerating(true);
-                
-                const userMsgObj = { role: 'user', text: userMessage, timestamp: Date.now() };
-                const updatedHistory = [...currentThread.messages, userMsgObj];
+                      <div className="flex-1 overflow-y-auto p-6 space-y-4">
+                          {currentThread ? (
+                              currentThread.messages.map((msg, index) => (
+                                  <div
+                                      key={index}
+                                      className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                                  >
+                                      <div className={`max-w-xl p-4 rounded-xl shadow-lg ${msg.role === 'user'
+                                          ? 'bg-indigo-600 text-white rounded-br-none'
+                                          : 'bg-gray-700 text-gray-100 rounded-tl-none'
+                                          }`}
+                                      >
+                                          <p className="text-xs font-semibold mb-1 opacity-70">
+                                              {msg.role === 'user' ? 'You' : 'Assistant'}
+                                          </p>
+                                          <p className="text-sm whitespace-pre-wrap">{msg.text}</p>
+                                      </div>
+                                  </div>
+                              ))
+                          ) : (
+                              <div className="flex items-center justify-center h-full">
+                                  <p className="text-gray-500 text-lg">
+                                      Start a new thread to begin your novel brainstorm!
+                                  </p>
+                              </div>
+                          )}
+                          {isGenerating && (
+                              <div className="flex justify-start">
+                                  <div className="max-w-xl p-4 rounded-xl shadow-lg bg-gray-700 text-gray-100 rounded-tl-none flex items-center space-x-2">
+                                      <div className="animate-pulse h-3 w-3 bg-indigo-400 rounded-full"></div>
+                                      <p className="text-sm italic">Assistant thinking...</p>
+                                  </div>
+                              </div>
+                          )}
+                          <div ref={chatEndRef} />
+                      </div>
 
-                try {
-                    // 1. Add user message to storage/state (Optimistic Update)
-                    if (isPersistent) {
-                        const threadDocRef = doc(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads', currentThread.id);
-                        await updateDoc(threadDocRef, { messages: arrayUnion(userMsgObj) });
-                    } else {
-                        // Optimistically update local state with user message
-                        updateLocalThreadMessages(currentThread.id, userMsgObj, null);
-                    }
+                      <footer className="p-4 border-t border-gray-700 bg-gray-800">
+                          <form onSubmit={handleSendMessage} className="flex space-x-3">
+                              <input
+                                  type="text"
+                                  value={newMessage}
+                                  onChange={(e) => setNewMessage(e.target.value)}
+                                  placeholder={currentThread ? "Ask the AI a question about this thread's content..." : "Select a thread first..."}
+                                  disabled={!currentThread || isGenerating}
+                                  className="flex-1 p-3 rounded-lg bg-gray-700 border border-gray-600 text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
+                              />
+                              <button
+                                  type="submit"
+                                  disabled={isButtonDisabled}
+                                  title={disabledReason}
+                                  className="bg-indigo-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-indigo-700 disabled:bg-indigo-800 disabled:opacity-50 transition duration-150 shadow-lg flex items-center justify-center"
+                              >
+                                  {isGenerating ? (
+                                      <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                      </svg>
+                                  ) : 'Generate'}
+                              </button>
+                          </form>
+                      </footer>
+                  </main>
+              </div>
+          );
+      };
 
-                    // 2. Call the LLM
-                    const aiResponseText = await callLLM(updatedHistory);
-
-                    // 3. Add AI response to storage/state
-                    const aiMsgObj = { role: 'model', text: aiResponseText, timestamp: Date.now() + 1 }; 
-                    
-                    if (isPersistent) {
-                        const threadDocRef = doc(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads', currentThread.id);
-                         await updateDoc(threadDocRef, { messages: arrayUnion(aiMsgObj) });
-                    } else {
-                        // Update local state with the AI message
-                        updateLocalThreadMessages(currentThread.id, null, aiMsgObj);
-                    }
-
-                } catch (error) {
-                    console.error("Error during send message/LLM call:", error);
-                    setErrorBanner(`AI generation failed: ${error.message}. Please check console for details.`);
-                } finally {
-                    // CRITICAL: Ensure state is reset regardless of success or failure
-                    setIsGenerating(false);
-                }
-            }, [newMessage, currentThread, isGenerating, isPersistent, updateLocalThreadMessages]);
-
-            // --- Import/Export Functions ---
-            
-            const handleExport = () => {
-                if (threads.length === 0) {
-                    setErrorBanner("No threads to export.");
-                    return;
-                }
-                const dataToExport = threads.map(t => ({ // Clean up for export
-                    name: t.name,
-                    createdAt: t.createdAt,
-                    messages: t.messages
-                }));
-
-                const dataStr = JSON.stringify(dataToExport, null, 2);
-                const blob = new Blob([dataStr], { type: "application/json" });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `novel-planner-export-${new Date().toISOString().slice(0, 10)}.json`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                setErrorBanner("All idea threads exported successfully as JSON.");
-            };
-
-            const handleImport = (event) => {
-                const file = event.target.files[0];
-                if (!file) return;
-
-                const reader = new FileReader();
-                reader.onload = async (e) => {
-                    try {
-                        const importedData = JSON.parse(e.target.result);
-                        
-                        if (!Array.isArray(importedData) || importedData.length === 0) {
-                            throw new Error("Invalid file format. Expected an array of thread objects.");
-                        }
-
-                        // Assign temporary IDs and check structure
-                        const validThreads = importedData.map(t => ({
-                            id: isPersistent ? null : crypto.randomUUID(), // New ID for local mode, null for persistent (will get ID on save)
-                            name: t.name || "Imported Thread",
-                            createdAt: t.createdAt || Date.now(),
-                            messages: Array.isArray(t.messages) ? t.messages : []
-                        }));
-                        
-                        // In persistent mode, we should ideally re-save them as new docs.
-                        if (isPersistent) {
-                            const newDocPromises = validThreads.map(t => 
-                                addDoc(collection(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads'), t)
-                            );
-                            await Promise.all(newDocPromises);
-                            setErrorBanner(`Successfully imported ${validThreads.length} threads into Firestore.`);
-                        } else {
-                            // In local mode, just set the state
-                            setThreads(prevThreads => [...validThreads, ...prevThreads]);
-                            setErrorBanner(`Successfully imported ${validThreads.length} threads locally.`);
-                        }
-
-                    } catch (error) {
-                        console.error("Import error:", error);
-                        setErrorBanner(`Failed to import file: ${error.message}`);
-                    }
-                };
-                reader.readAsText(file);
-                // Reset file input value so same file can be imported again
-                event.target.value = null; 
-            };
-            
-            // --- Helper Component: Custom Modal ---
-            const NewThreadModal = () => (
-                <div className="modal-overlay">
-                    <div className="bg-gray-800 p-6 rounded-xl shadow-2xl w-full max-w-sm border border-indigo-700">
-                        <h3 className="text-xl font-bold mb-4 text-indigo-400">Name Your Idea Thread</h3>
-                        <p className="text-sm text-gray-400 mb-4">Choose a short, descriptive title (e.g., "Elara's Arc," "Magic System Rules").</p>
-                        <input
-                            type="text"
-                            value={newThreadName}
-                            onChange={(e) => setNewThreadName(e.target.value)}
-                            placeholder="e.g., Main Character Backstory"
-                            className="w-full p-3 mb-4 rounded-lg bg-gray-700 border border-gray-600 text-white focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-                            onKeyPress={(e) => {
-                                if (e.key === 'Enter' && newThreadName.trim()) {
-                                    handleCreateThread();
-                                }
-                            }}
-                            autoFocus
-                        />
-                        <div className="flex justify-end space-x-3">
-                            <button
-                                onClick={() => { setIsModalOpen(false); setNewThreadName(''); }}
-                                className="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-600 hover:bg-gray-500 transition duration-150"
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                onClick={handleCreateThread}
-                                disabled={!newThreadName.trim()}
-                                className="px-4 py-2 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-800 disabled:opacity-50 transition duration-150"
-                            >
-                                Create Thread
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            );
-            
-            // Debugging helper for button state
-            const isButtonDisabled = !currentThread || !newMessage.trim() || isGenerating;
-            const disabledReason = useMemo(() => {
-                if (isGenerating) return "Generating Response...";
-                if (!currentThread) return "No Thread Selected. Click '+ New Thread' first.";
-                if (!newMessage.trim()) return "Message is Empty";
-                return "";
-            }, [currentThread, newMessage, isGenerating]);
-
-
-            if (loading && firebaseReady) {
-                return (
-                    <div className="flex items-center justify-center h-screen bg-gray-900 text-white">
-                        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-indigo-400"></div>
-                        <p className="ml-3">Fetching saved threads...</p>
-                    </div>
-                );
-            } else if (loading && !firebaseReady) {
-                 return (
-                    <div className="flex items-center justify-center h-screen bg-gray-900 text-white">
-                        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-indigo-400"></div>
-                        <p className="ml-3">Initializing database connection...</p>
-                    </div>
-                );
-            }
-
-
-            return (
-                <div className="flex h-screen bg-gray-900 text-gray-100 font-inter">
-                    {/* Modal Overlay */}
-                    {isModalOpen && <NewThreadModal />}
-
-                    {/* Error Banner */}
-                    {errorBanner && (
-                        <div className="absolute top-0 left-0 right-0 p-3 bg-red-800 text-white text-center font-medium z-40">
-                            {errorBanner}
-                            <button onClick={() => setErrorBanner(null)} className="ml-4 text-sm font-semibold opacity-75 hover:opacity-100">
-                                (Dismiss)
-                            </button>
-                        </div>
-                    )}
-                    
-                    <!-- Sidebar -->
-                    <aside className="w-72 bg-gray-800 border-r border-gray-700 flex flex-col p-4 overflow-y-auto" style={{ paddingTop: errorBanner ? '4rem' : '1rem' }}>
-                        <h1 className="text-2xl font-bold mb-4 text-indigo-400">Idea Threads</h1>
-                        <p className="text-xs text-gray-500 mb-4 break-words" title={userIdRef.current}>User ID: {userIdRef.current || 'N/A'}</p>
-
-                        <button
-                            onClick={() => setIsModalOpen(true)}
-                            className="w-full py-2 px-4 mb-3 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 transition duration-150 shadow-md"
-                        >
-                            + New Thread
-                        </button>
-                        
-                        <!-- Import/Export Buttons -->
-                        <div className="flex justify-between space-x-2 mb-4">
-                            <input
-                                type="file"
-                                accept=".json"
-                                onChange={handleImport}
-                                ref={fileInputRef}
-                                className="file-input-hidden"
-                            />
-                            <button
-                                onClick={() => fileInputRef.current.click()}
-                                className="flex-1 py-2 px-1 text-xs font-semibold rounded-lg bg-gray-600 hover:bg-gray-500 transition duration-150"
-                            >
-                                Import JSON
-                            </button>
-                            <button
-                                onClick={handleExport}
-                                className="flex-1 py-2 px-1 text-xs font-semibold rounded-lg bg-gray-600 hover:bg-gray-500 transition duration-150"
-                            >
-                                Export JSON
-                            </button>
-                        </div>
-
-                        <nav className="flex-grow">
-                            {threads.length === 0 ? (
-                                <p className="text-sm text-gray-500 italic">No threads yet. Click '+ New Thread' above.</p>
-                            ) : (
-                                threads.map(thread => (
-                                    <button
-                                        key={thread.id}
-                                        onClick={() => setActiveThreadId(thread.id)}
-                                        className={`w-full text-left py-2 px-3 mb-2 rounded-lg transition duration-150 ${thread.id === activeThreadId ? 'bg-indigo-700 text-white font-semibold shadow-inner' : 'bg-gray-700 hover:bg-gray-600'
-                                            } text-sm truncate`}
-                                        title={thread.name}
-                                    >
-                                        {thread.name}
-                                    </button>
-                                ))
-                            )}
-                        </nav>
-                    </aside>
-
-                    <!-- Chat Area -->
-                    <main className="flex-1 flex flex-col">
-                        <header className="p-4 border-b border-gray-700 bg-gray-800 shadow-lg">
-                            <h2 className="text-xl font-bold truncate text-white">
-                                {currentThread ? currentThread.name : 'Select or Create a Thread'}
-                            </h2>
-                        </header>
-
-                        <div className="flex-1 overflow-y-auto p-6 space-y-4">
-                            {currentThread ? (
-                                currentThread.messages.map((msg, index) => (
-                                    <div
-                                        key={index}
-                                        className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                                    >
-                                        <div className={`max-w-xl p-4 rounded-xl shadow-lg ${msg.role === 'user'
-                                            ? 'bg-indigo-600 text-white rounded-br-none'
-                                            : 'bg-gray-700 text-gray-100 rounded-tl-none'
-                                            }`}
-                                        >
-                                            <p className="text-xs font-semibold mb-1 opacity-70">
-                                                {msg.role === 'user' ? 'You' : 'Assistant'}
-                                            </p>
-                                            <p className="text-sm whitespace-pre-wrap">{msg.text}</p>
-                                        </div>
-                                    </div>
-                                ))
-                            ) : (
-                                <div className="flex items-center justify-center h-full">
-                                    <p className="text-gray-500 text-lg">
-                                        Start a new thread to begin your novel brainstorm!
-                                    </p>
-                                </div>
-                            )}
-                            {isGenerating && (
-                                <div className="flex justify-start">
-                                    <div className="max-w-xl p-4 rounded-xl shadow-lg bg-gray-700 text-gray-100 rounded-tl-none flex items-center space-x-2">
-                                        <div className="animate-pulse h-3 w-3 bg-indigo-400 rounded-full"></div>
-                                        <p className="text-sm italic">Assistant thinking...</p>
-                                    </div>
-                                </div>
-                            )}
-                            <div ref={chatEndRef} />
-                        </div>
-
-                        <!-- Input Area -->
-                        <footer className="p-4 border-t border-gray-700 bg-gray-800">
-                            <form onSubmit={handleSendMessage} className="flex space-x-3">
-                                <input
-                                    type="text"
-                                    value={newMessage}
-                                    onChange={(e) => setNewMessage(e.target.value)}
-                                    placeholder={currentThread ? "Ask the AI a question about this thread's content..." : "Select a thread first..."}
-                                    disabled={!currentThread || isGenerating}
-                                    className="flex-1 p-3 rounded-lg bg-gray-700 border border-gray-600 text-white placeholder-gray-400 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150"
-                                />
-                                <button
-                                    type="submit"
-                                    disabled={isButtonDisabled}
-                                    title={disabledReason}
-                                    className="bg-indigo-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-indigo-700 disabled:bg-indigo-800 disabled:opacity-50 transition duration-150 shadow-lg flex items-center justify-center"
-                                >
-                                    {isGenerating ? (
-                                        <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                        </svg>
-                                    ) : 'Generate'}
-                                </button>
-                            </form>
-                        </footer>
-                    </main>
-                </div>
-            );
-        };
-
-        // Standard React rendering to the 'root' element
-        const container = document.getElementById('root');
-        if (container) {
-            const root = ReactDOM.createRoot(container);
-            root.render(<App />);
-        }
+      // Render the React App
+      const container = document.getElementById('root');
+      if (container) {
+          const root = ReactDOM.createRoot(container);
+          root.render(<App />);
+      }
     </script>
 </body>
 </html>
