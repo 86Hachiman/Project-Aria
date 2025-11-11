@@ -13,6 +13,7 @@
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <!-- Load Firebase/Firestore CDNs -->
     <script type="module">
+        // Import necessary Firebase functions (only if config is present, otherwise they won't be used)
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, addDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
@@ -39,16 +40,14 @@
     <script type="text/babel">
         const { useState, useEffect, useCallback, useMemo, useRef } = React;
         
-        // --- Global variables provided by the Canvas environment (Mandatory Use) ---
-        // Fallbacks are essential for local execution
+        // --- Environment Variables (Will be empty/null outside the platform) ---
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'novel-planner-app';
+        // Note: firebaseConfig is empty outside the platform, triggering the fallback.
         const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-        // Ensure Firebase globals are available
         const { initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, addDoc } = window.firebase || {};
-
-
+        
         // LLM Configuration
         const LLM_MODEL = "gemini-2.5-flash-preview-09-2025";
         const LLM_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${LLM_MODEL}:generateContent`;
@@ -56,12 +55,8 @@
 
         /**
          * Handles the LLM API call with exponential backoff.
-         * @param {Array<Object>} history - The full message history of the current thread.
-         * @returns {Promise<string>} - The generated text response.
          */
         async function callLLM(history) {
-            // Note: The LLM model is now being called with the full history as requested.
-            
             const contents = history.map(msg => ({
                 role: msg.role === 'user' ? 'user' : 'model',
                 parts: [{ text: msg.text }]
@@ -117,16 +112,48 @@
             const [loading, setLoading] = useState(true);
             const [isGenerating, setIsGenerating] = useState(false);
             const [firebaseReady, setFirebaseReady] = useState(false);
+            const [isPersistent, setIsPersistent] = useState(true); // Default to persistent
+            const [errorBanner, setErrorBanner] = useState(null);
 
             const dbRef = useRef(null);
             const authRef = useRef(null);
             const userIdRef = useRef(null);
             const chatEndRef = useRef(null);
 
-            // Effect 1: Initialize Firebase and handle Authentication
+            // Helper function for local state updates (when persistence is off)
+            const updateLocalThreadMessages = useCallback((threadId, userMsgObj, aiMsgObj) => {
+                setThreads(prevThreads => prevThreads.map(t => {
+                    if (t.id === threadId) {
+                        // Find the last user message to avoid duplication if running optimistically
+                        const newMessages = [...t.messages];
+                        if (userMsgObj) {
+                           newMessages.push(userMsgObj);
+                        }
+                        if (aiMsgObj) {
+                            newMessages.push(aiMsgObj);
+                        }
+                        return { 
+                            ...t, 
+                            messages: newMessages
+                        };
+                    }
+                    return t;
+                }));
+            }, []);
+
+            // Effect 1: Initialize Firebase or Fallback to Local Mode
             useEffect(() => {
-                if (!initializeApp) return console.error("Firebase libraries not loaded.");
+                // FALLBACK: If config is empty or libraries are missing, switch to local mode immediately
+                if (Object.keys(firebaseConfig).length === 0 || !initializeApp) {
+                    setErrorBanner("Database connection failed. App is running in **non-persistent** mode (data will NOT be saved when you close the tab).");
+                    setIsPersistent(false);
+                    setFirebaseReady(true);
+                    setLoading(false);
+                    userIdRef.current = 'local-user';
+                    return;
+                }
                 
+                // STANDARD: Initialize Firebase
                 try {
                     const app = initializeApp(firebaseConfig);
                     authRef.current = getAuth(app);
@@ -142,18 +169,30 @@
                         }
                         userIdRef.current = authRef.current.currentUser?.uid || crypto.randomUUID();
                         setFirebaseReady(true);
+                    }, (authError) => {
+                        console.error("CRITICAL AUTH ERROR:", authError);
+                        setErrorBanner("Authentication Failed. App will be non-persistent.");
+                        setIsPersistent(false);
+                        setFirebaseReady(true);
+                        setLoading(false);
                     });
 
                     return () => unsubscribe();
                 } catch (error) {
-                    console.error("Firebase initialization failed:", error);
+                    console.error("CRITICAL: Firebase initialization failed:", error);
+                    setErrorBanner("Initialization Failed. App will be non-persistent.");
+                    setIsPersistent(false);
+                    setFirebaseReady(true);
                     setLoading(false);
                 }
             }, []);
 
-            // Effect 2: Load Threads and set up Snapshot Listener
+            // Effect 2: Load Threads (Only runs if persistent)
             useEffect(() => {
-                if (!firebaseReady || !dbRef.current || !userIdRef.current) return;
+                if (!firebaseReady || !isPersistent || !dbRef.current || !userIdRef.current) {
+                    // If not persistent, setLoading(false) already happened in Effect 1.
+                    return;
+                }
 
                 const threadsCollectionRef = collection(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads');
                 const threadsQuery = query(threadsCollectionRef, orderBy('createdAt', 'desc'));
@@ -173,12 +212,13 @@
 
                     setLoading(false);
                 }, (error) => {
-                    console.error("Error fetching threads:", error);
+                    console.error("FIRESTORE SNAPSHOT ERROR:", error);
+                    setErrorBanner("Failed to load threads from database. Check security rules.");
                     setLoading(false);
                 });
 
                 return () => unsubscribe();
-            }, [firebaseReady, activeThreadId]);
+            }, [firebaseReady, activeThreadId, isPersistent]);
 
             // Effect 3: Scroll to the bottom of the chat when messages update
             useEffect(() => {
@@ -191,13 +231,14 @@
             const currentThread = useMemo(() => {
                 return threads.find(t => t.id === activeThreadId);
             }, [threads, activeThreadId]);
-
+            
             const handleCreateThread = async (e) => {
                 e.preventDefault();
                 const threadName = prompt("Enter a name for your new idea thread (e.g., Main Plot Outline, Character: Elara):");
                 if (!threadName || !threadName.trim()) return;
 
                 const newThread = {
+                    id: isPersistent ? null : crypto.randomUUID(), // Local ID only if non-persistent
                     name: threadName.trim(),
                     createdAt: Date.now(),
                     messages: [{
@@ -205,12 +246,20 @@
                         text: `Welcome to the '${threadName.trim()}' thread! This is dedicated to developing this specific novel concept. Let's start with your first idea or question.`
                     }]
                 };
-
-                try {
-                    const docRef = await addDoc(collection(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads'), newThread);
-                    setActiveThreadId(docRef.id);
-                } catch (error) {
-                    console.error("Error creating new thread:", error);
+                
+                if (isPersistent) {
+                    try {
+                        // Use Firestore for saving
+                        const docRef = await addDoc(collection(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads'), newThread);
+                        setActiveThreadId(docRef.id);
+                    } catch (error) {
+                        console.error("Error creating new thread (Persistent):", error);
+                        setErrorBanner("Failed to save thread to database. Check connection.");
+                    }
+                } else {
+                    // Use Local State for saving (Non-persistent)
+                    setThreads(prevThreads => [newThread, ...prevThreads]);
+                    setActiveThreadId(newThread.id);
                 }
             };
 
@@ -221,55 +270,78 @@
                 const userMessage = newMessage.trim();
                 setNewMessage('');
                 setIsGenerating(true);
-
-                const threadDocRef = doc(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads', currentThread.id);
+                
+                const userMsgObj = { role: 'user', text: userMessage, timestamp: Date.now() };
+                const updatedHistory = [...currentThread.messages, userMsgObj];
 
                 try {
-                    // 1. Locally update messages for optimistic display
-                    const userMsgObj = { role: 'user', text: userMessage, timestamp: Date.now() };
+                    // 1. Add user message to storage/state
+                    if (isPersistent) {
+                        const threadDocRef = doc(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads', currentThread.id);
+                        await updateDoc(threadDocRef, { messages: arrayUnion(userMsgObj) });
+                    } else {
+                        // Optimistically update local state with user message
+                        updateLocalThreadMessages(currentThread.id, userMsgObj, null);
+                    }
 
-                    // 2. Add user message to Firestore
-                    await updateDoc(threadDocRef, {
-                        messages: arrayUnion(userMsgObj)
-                    });
-
-                    // 3. Prepare full history for LLM call
-                    const updatedHistory = [...currentThread.messages, userMsgObj];
-
-                    // 4. Call the LLM
+                    // 2. Call the LLM
                     const aiResponseText = await callLLM(updatedHistory);
 
-                    // 5. Add AI response to Firestore
-                    const aiMsgObj = { role: 'model', text: aiResponseText, timestamp: Date.now() + 1 }; // +1 to ensure order
-                    await updateDoc(threadDocRef, {
-                        messages: arrayUnion(aiMsgObj)
-                    });
+                    // 3. Add AI response to storage/state
+                    const aiMsgObj = { role: 'model', text: aiResponseText, timestamp: Date.now() + 1 }; 
+                    
+                    if (isPersistent) {
+                        const threadDocRef = doc(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads', currentThread.id);
+                         await updateDoc(threadDocRef, { messages: arrayUnion(aiMsgObj) });
+                    } else {
+                        // Update local state with the AI message
+                        updateLocalThreadMessages(currentThread.id, null, aiMsgObj);
+                    }
 
                 } catch (error) {
                     console.error("Error during send message/LLM call:", error);
-                    // Using a non-alert message box for better user experience
-                    // alert(`Failed to get AI response: ${error.message}`); 
+                    setErrorBanner(`AI generation failed: ${error.message}.`);
                 } finally {
                     setIsGenerating(false);
                 }
-            }, [newMessage, currentThread, isGenerating]);
+            }, [newMessage, currentThread, isGenerating, isPersistent, updateLocalThreadMessages]);
 
 
-            if (loading || !firebaseReady) {
+            if (loading && firebaseReady) {
+                 // Brief wait for data to fetch
                 return (
                     <div className="flex items-center justify-center h-screen bg-gray-900 text-white">
                         <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-indigo-400"></div>
-                        <p className="ml-3">Loading Novelist's Brain...</p>
+                        <p className="ml-3">Fetching saved threads...</p>
+                    </div>
+                );
+            } else if (loading && !firebaseReady) {
+                 // Longer wait for Firebase connection establishment
+                 return (
+                    <div className="flex items-center justify-center h-screen bg-gray-900 text-white">
+                        <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-indigo-400"></div>
+                        <p className="ml-3">Initializing database connection...</p>
                     </div>
                 );
             }
 
+
             return (
                 <div className="flex h-screen bg-gray-900 text-gray-100 font-inter">
+                    {/* Error Banner */}
+                    {errorBanner && (
+                        <div className="absolute top-0 left-0 right-0 p-3 bg-red-800 text-white text-center font-medium z-10">
+                            {errorBanner}
+                            <button onClick={() => setErrorBanner(null)} className="ml-4 text-sm font-semibold opacity-75 hover:opacity-100">
+                                (Dismiss)
+                            </button>
+                        </div>
+                    )}
+                    
                     {/* Sidebar */}
-                    <aside className="w-72 bg-gray-800 border-r border-gray-700 flex flex-col p-4 overflow-y-auto">
+                    <aside className="w-72 bg-gray-800 border-r border-gray-700 flex flex-col p-4 overflow-y-auto" style={{ paddingTop: errorBanner ? '4rem' : '1rem' }}>
                         <h1 className="text-2xl font-bold mb-4 text-indigo-400">Idea Threads</h1>
-                        <p className="text-xs text-gray-500 mb-4 break-words">User ID: {userIdRef.current}</p>
+                        <p className="text-xs text-gray-500 mb-4 break-words">User ID: {userIdRef.current || 'N/A'}</p>
 
                         <button
                             onClick={handleCreateThread}
