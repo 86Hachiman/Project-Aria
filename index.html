@@ -13,16 +13,21 @@
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <!-- Load Firebase/Firestore CDNs -->
     <script type="module">
-        // Import necessary Firebase functions (only if config is present, otherwise they won't be used)
+        // Import necessary Firebase functions (only if config is present)
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, addDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-
+        
         // Expose Firebase functions globally for the <script type="text/babel"> block
         window.firebase = {
             initializeApp, getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged,
             getFirestore, collection, onSnapshot, doc, updateDoc, query, orderBy, arrayUnion, addDoc, setLogLevel
         };
+
+        // Log levels for Firestore debugging (added safety check)
+        if (typeof setLogLevel !== 'undefined') {
+            setLogLevel('debug');
+        }
     </script>
     <style>
         body {
@@ -43,6 +48,10 @@
             align-items: center;
             z-index: 50;
         }
+        /* Hide the file input but keep its functionality */
+        .file-input-hidden {
+            display: none;
+        }
     </style>
 </head>
 <body class="bg-gray-900">
@@ -53,7 +62,7 @@
     <script type="text/babel">
         const { useState, useEffect, useCallback, useMemo, useRef } = React;
         
-        // --- Environment Variables (Will be empty/null outside the platform) ---
+        // --- Environment Variables ---
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'novel-planner-app';
         const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
@@ -96,7 +105,10 @@
                             await new Promise(resolve => setTimeout(resolve, delay));
                             continue;
                         }
-                        throw new Error(`LLM API request failed with status: ${response.status}`);
+                        // For non-retryable errors, throw them immediately
+                        const errorBody = await response.json();
+                        const errorMessage = errorBody.error?.message || `LLM API request failed with status: ${response.status}`;
+                        throw new Error(errorMessage);
                     }
 
                     const result = await response.json();
@@ -111,6 +123,7 @@
                 } catch (error) {
                     console.error(`Attempt ${attempt + 1} failed:`, error);
                     if (attempt === 4) throw new Error("Failed to communicate with the Novel Assistant AI after multiple retries.");
+                    throw error; 
                 }
             }
         }
@@ -127,7 +140,6 @@
             const [isPersistent, setIsPersistent] = useState(true); 
             const [errorBanner, setErrorBanner] = useState(null);
             
-            // New State for Modal
             const [isModalOpen, setIsModalOpen] = useState(false);
             const [newThreadName, setNewThreadName] = useState('');
 
@@ -135,6 +147,7 @@
             const authRef = useRef(null);
             const userIdRef = useRef(null);
             const chatEndRef = useRef(null);
+            const fileInputRef = useRef(null); // Ref for file import
 
             // Helper function for local state updates (when persistence is off)
             const updateLocalThreadMessages = useCallback((threadId, userMsgObj, aiMsgObj) => {
@@ -158,7 +171,6 @@
 
             // Effect 1: Initialize Firebase or Fallback to Local Mode
             useEffect(() => {
-                // FALLBACK: If config is empty or libraries are missing, switch to local mode immediately
                 if (Object.keys(firebaseConfig).length === 0 || !initializeApp) {
                     setErrorBanner("Database connection failed. App is running in **non-persistent** mode (data will NOT be saved when you close the tab).");
                     setIsPersistent(false);
@@ -168,7 +180,6 @@
                     return;
                 }
                 
-                // STANDARD: Initialize Firebase
                 try {
                     const app = initializeApp(firebaseConfig);
                     authRef.current = getAuth(app);
@@ -176,16 +187,22 @@
 
                     const unsubscribe = onAuthStateChanged(authRef.current, async (user) => {
                         if (!user) {
-                            if (initialAuthToken) {
-                                await signInWithCustomToken(authRef.current, initialAuthToken);
-                            } else {
-                                await signInAnonymously(authRef.current);
+                            try {
+                                if (initialAuthToken) {
+                                    await signInWithCustomToken(authRef.current, initialAuthToken);
+                                } else {
+                                    await signInAnonymously(authRef.current);
+                                }
+                            } catch(authError) {
+                                console.error("Sign-in failed:", authError);
+                                setErrorBanner("Authentication failed. Running non-persistent.");
+                                setIsPersistent(false);
                             }
                         }
                         userIdRef.current = authRef.current.currentUser?.uid || crypto.randomUUID();
                         setFirebaseReady(true);
                     }, (authError) => {
-                        console.error("CRITICAL AUTH ERROR:", authError);
+                        console.error("CRITICAL AUTH LISTENER ERROR:", authError);
                         setErrorBanner("Authentication Failed. App will be non-persistent.");
                         setIsPersistent(false);
                         setFirebaseReady(true);
@@ -205,6 +222,7 @@
             // Effect 2: Load Threads (Only runs if persistent)
             useEffect(() => {
                 if (!firebaseReady || !isPersistent || !dbRef.current || !userIdRef.current) {
+                    if (!isPersistent) setLoading(false);
                     return;
                 }
 
@@ -218,16 +236,20 @@
                     }));
 
                     setThreads(newThreads);
-                    if (!activeThreadId && newThreads.length > 0) {
-                        setActiveThreadId(newThreads[0].id);
-                    } else if (activeThreadId && !newThreads.some(t => t.id === activeThreadId)) {
-                        setActiveThreadId(newThreads.length > 0 ? newThreads[0].id : null);
+                    // Ensure active thread ID is valid or set to the latest one
+                    if (!activeThreadId || !newThreads.some(t => t.id === activeThreadId)) {
+                        if (newThreads.length > 0) {
+                             setActiveThreadId(newThreads[0].id);
+                        } else {
+                             setActiveThreadId(null);
+                        }
                     }
 
                     setLoading(false);
                 }, (error) => {
                     console.error("FIRESTORE SNAPSHOT ERROR:", error);
-                    setErrorBanner("Failed to load threads from database. Check security rules.");
+                    setErrorBanner("Failed to load threads from database. Check security rules. Switching to non-persistent mode.");
+                    setIsPersistent(false); // Fallback on snapshot error
                     setLoading(false);
                 });
 
@@ -269,7 +291,7 @@
                         setActiveThreadId(docRef.id);
                     } catch (error) {
                         console.error("Error creating new thread (Persistent):", error);
-                        setErrorBanner("Failed to save thread to database. Check connection.");
+                        setErrorBanner("Failed to save thread to database. Check connection. Thread was not created.");
                     }
                 } else {
                     // Use Local State for saving (Non-persistent)
@@ -290,7 +312,7 @@
                 const updatedHistory = [...currentThread.messages, userMsgObj];
 
                 try {
-                    // 1. Add user message to storage/state
+                    // 1. Add user message to storage/state (Optimistic Update)
                     if (isPersistent) {
                         const threadDocRef = doc(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads', currentThread.id);
                         await updateDoc(threadDocRef, { messages: arrayUnion(userMsgObj) });
@@ -315,13 +337,83 @@
 
                 } catch (error) {
                     console.error("Error during send message/LLM call:", error);
-                    setErrorBanner(`AI generation failed: ${error.message}.`);
+                    setErrorBanner(`AI generation failed: ${error.message}. Please check console for details.`);
                 } finally {
+                    // CRITICAL: Ensure state is reset regardless of success or failure
                     setIsGenerating(false);
                 }
             }, [newMessage, currentThread, isGenerating, isPersistent, updateLocalThreadMessages]);
 
+            // --- Import/Export Functions ---
+            
+            const handleExport = () => {
+                if (threads.length === 0) {
+                    setErrorBanner("No threads to export.");
+                    return;
+                }
+                const dataToExport = threads.map(t => ({ // Clean up for export
+                    name: t.name,
+                    createdAt: t.createdAt,
+                    messages: t.messages
+                }));
 
+                const dataStr = JSON.stringify(dataToExport, null, 2);
+                const blob = new Blob([dataStr], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `novel-planner-export-${new Date().toISOString().slice(0, 10)}.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                setErrorBanner("All idea threads exported successfully as JSON.");
+            };
+
+            const handleImport = (event) => {
+                const file = event.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = async (e) => {
+                    try {
+                        const importedData = JSON.parse(e.target.result);
+                        
+                        if (!Array.isArray(importedData) || importedData.length === 0) {
+                            throw new Error("Invalid file format. Expected an array of thread objects.");
+                        }
+
+                        // Assign temporary IDs and check structure
+                        const validThreads = importedData.map(t => ({
+                            id: isPersistent ? null : crypto.randomUUID(), // New ID for local mode, null for persistent (will get ID on save)
+                            name: t.name || "Imported Thread",
+                            createdAt: t.createdAt || Date.now(),
+                            messages: Array.isArray(t.messages) ? t.messages : []
+                        }));
+                        
+                        // In persistent mode, we should ideally re-save them as new docs.
+                        if (isPersistent) {
+                            const newDocPromises = validThreads.map(t => 
+                                addDoc(collection(dbRef.current, 'artifacts', appId, 'users', userIdRef.current, 'novelThreads'), t)
+                            );
+                            await Promise.all(newDocPromises);
+                            setErrorBanner(`Successfully imported ${validThreads.length} threads into Firestore.`);
+                        } else {
+                            // In local mode, just set the state
+                            setThreads(prevThreads => [...validThreads, ...prevThreads]);
+                            setErrorBanner(`Successfully imported ${validThreads.length} threads locally.`);
+                        }
+
+                    } catch (error) {
+                        console.error("Import error:", error);
+                        setErrorBanner(`Failed to import file: ${error.message}`);
+                    }
+                };
+                reader.readAsText(file);
+                // Reset file input value so same file can be imported again
+                event.target.value = null; 
+            };
+            
             // --- Helper Component: Custom Modal ---
             const NewThreadModal = () => (
                 <div className="modal-overlay">
@@ -359,6 +451,15 @@
                     </div>
                 </div>
             );
+            
+            // Debugging helper for button state
+            const isButtonDisabled = !currentThread || !newMessage.trim() || isGenerating;
+            const disabledReason = useMemo(() => {
+                if (isGenerating) return "Generating Response...";
+                if (!currentThread) return "No Thread Selected. Click '+ New Thread' first.";
+                if (!newMessage.trim()) return "Message is Empty";
+                return "";
+            }, [currentThread, newMessage, isGenerating]);
 
 
             if (loading && firebaseReady) {
@@ -393,17 +494,40 @@
                         </div>
                     )}
                     
-                    {/* Sidebar */}
+                    <!-- Sidebar -->
                     <aside className="w-72 bg-gray-800 border-r border-gray-700 flex flex-col p-4 overflow-y-auto" style={{ paddingTop: errorBanner ? '4rem' : '1rem' }}>
                         <h1 className="text-2xl font-bold mb-4 text-indigo-400">Idea Threads</h1>
-                        <p className="text-xs text-gray-500 mb-4 break-words">User ID: {userIdRef.current || 'N/A'}</p>
+                        <p className="text-xs text-gray-500 mb-4 break-words" title={userIdRef.current}>User ID: {userIdRef.current || 'N/A'}</p>
 
                         <button
                             onClick={() => setIsModalOpen(true)}
-                            className="w-full py-2 px-4 mb-4 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 transition duration-150 shadow-md"
+                            className="w-full py-2 px-4 mb-3 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 transition duration-150 shadow-md"
                         >
                             + New Thread
                         </button>
+                        
+                        <!-- Import/Export Buttons -->
+                        <div className="flex justify-between space-x-2 mb-4">
+                            <input
+                                type="file"
+                                accept=".json"
+                                onChange={handleImport}
+                                ref={fileInputRef}
+                                className="file-input-hidden"
+                            />
+                            <button
+                                onClick={() => fileInputRef.current.click()}
+                                className="flex-1 py-2 px-1 text-xs font-semibold rounded-lg bg-gray-600 hover:bg-gray-500 transition duration-150"
+                            >
+                                Import JSON
+                            </button>
+                            <button
+                                onClick={handleExport}
+                                className="flex-1 py-2 px-1 text-xs font-semibold rounded-lg bg-gray-600 hover:bg-gray-500 transition duration-150"
+                            >
+                                Export JSON
+                            </button>
+                        </div>
 
                         <nav className="flex-grow">
                             {threads.length === 0 ? (
@@ -424,7 +548,7 @@
                         </nav>
                     </aside>
 
-                    {/* Chat Area */}
+                    <!-- Chat Area -->
                     <main className="flex-1 flex flex-col">
                         <header className="p-4 border-b border-gray-700 bg-gray-800 shadow-lg">
                             <h2 className="text-xl font-bold truncate text-white">
@@ -482,7 +606,8 @@
                                 />
                                 <button
                                     type="submit"
-                                    disabled={!currentThread || !newMessage.trim() || isGenerating}
+                                    disabled={isButtonDisabled}
+                                    title={disabledReason}
                                     className="bg-indigo-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-indigo-700 disabled:bg-indigo-800 disabled:opacity-50 transition duration-150 shadow-lg flex items-center justify-center"
                                 >
                                     {isGenerating ? (
